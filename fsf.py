@@ -1,9 +1,11 @@
 from __future__ import annotations
 import math
 from dataclasses import dataclass
+from multiprocessing.resource_sharer import stop
 from typing import List, Optional, Tuple, Dict
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 
 
 # =========================
@@ -238,29 +240,35 @@ def start_drop(df: pd.DataFrame,
 # 6) Trajectory reference point (drop + 9 s)
 # =========================
 
-def reference_point_drop_plus_9s(df: pd.DataFrame, idx_drop: int, offset_s: float = 9.0) -> Optional[int]:
+def reference_point(df: pd.DataFrame, idx_drop: int=0, vhTreshold : float= 10.0, offset_s: float = 9.0) -> Optional[int]:
     """
-    Returns the index closest to (time_drop + offset_s).
+    Returns the index closest to (10m/s after drop + offset_s).
     """
-    if idx_drop is None:
-        return None
+    #search for index after idx_drop where vertical speed > vhTreshold
+    vz_up = _vertical_speed_up_mps(df)
+    idx_vh = None
+    for i in range(idx_drop + 1, len(vz_up)):
+        if vz_up[i] > vhTreshold:
+            idx_vh = i
+            break
+    if idx_vh is None:
+        idx_vh = idx_drop
     t = _to_datetime_utc(df["time"])
-    t_ref = t.iloc[idx_drop] + pd.to_timedelta(offset_s, unit="s")
+    t_ref = t.iloc[idx_vh] + pd.to_timedelta(offset_s, unit="s")
     # index of the closest time
     i = int(np.argmin(np.abs((t - t_ref).dt.total_seconds().to_numpy())))
     return i
-
 
 # =========================
 # 7) Start of glide (2500 m) & end (1500 m)
 # =========================
 
-def start_glide_2500(df: pd.DataFrame, agl: np.ndarray, idx_start_search: Optional[int]) -> Optional[int]:
+def start_glide_2500(df: pd.DataFrame, agl: np.ndarray, idx_start_search: Optional[int], startagl=2500) -> Optional[int]:
     """
     First passage below 2500 m AGL after idx_start_search (inclusive).
     """
     start = idx_start_search or 0
-    idxs = np.where(agl[start:] < 2500.0)[0]
+    idxs = np.where(agl[start:] < startagl)[0]
     return int(start + idxs[0]) if idxs.size else None
 
 def end_glide_1500(df: pd.DataFrame, agl: np.ndarray, idx_glide_start: Optional[int]) -> Optional[int]:
@@ -279,8 +287,11 @@ def end_glide_1500(df: pd.DataFrame, agl: np.ndarray, idx_glide_start: Optional[
 
 def parachute_deployment(df: pd.DataFrame,
                          agl: np.ndarray,
+                         min_agl_m: float = 1000.0,
+                         max_agl_m: float = 1500.0,
                          window_s: float = 2.0,
-                         min_drop_kmh: float = 20.0) -> Optional[int]:
+                         min_drop_kmh: float = 20.0,
+                         startidx: Optional[int] = None) -> Optional[int]:
     """
     Searches, between 1500 and 1100 m AGL, for the moment when ground speed undergoes the sharpest drop
     (> min_drop_kmh in window_s). Returns the index of the start of the drop.
@@ -292,7 +303,7 @@ def parachute_deployment(df: pd.DataFrame,
         dt_mode = 1.0
     win = max(1, int(round(window_s / dt_mode)))
 
-    zone = (agl <= 1500.0) & (agl >= 1100.0) & np.isfinite(v)
+    zone = (agl <= max_agl_m) & (agl >= min_agl_m) & np.isfinite(v)
     idx = np.where(zone)[0]
     if idx.size < win + 1:
         return None
@@ -674,91 +685,274 @@ def correct_ground_speed_glide(df: pd.DataFrame,
 # 13) Visualization of time/altitude metrics
 # =========================
 
+
+def relocateDataset(
+    datasets: List[Tuple[str, pd.DataFrame]] | List[pd.DataFrame],
+    target_agl: float,
+) -> List[Tuple[str, pd.DataFrame]] | List[pd.DataFrame]:
+    """
+    Synchronize multiple datasets on the first dataset by aligning the index
+    (>= start_index) where a given AGL (target_agl) is reached.
+
+    Rules:
+        - First dataset is the reference (unchanged).
+        - Synchronization point = index in reference (>= start_index) whose AGL is
+        closest to target_agl.
+        - For every other dataset:
+            * Find its own closest index >= start_index to target_agl.
+            * If its index < ref_sync_index: pad the front with copies of the first row
+            (duplicate timestamps as-is) so its sync index shifts right.
+            * If its index > ref_sync_index: drop the first rows so that the sync index shifts left.
+
+    Returns a new list with adjusted DataFrames (labels preserved if provided).
+    """
+    if not datasets:
+        return datasets
+
+    # Normalize input shape (with labels or not)
+    with_labels = isinstance(datasets[0], tuple) and len(datasets[0]) == 2
+    if with_labels:
+        labels, dfs = zip(*datasets)
+        dfs = list(dfs)
+    else:
+        dfs = list(datasets)
+
+    def compute_agl(df: pd.DataFrame) -> np.ndarray:
+        idx_ascent = start_aircraft_ascent(df)
+        g = average_ground_altitude(df, idx_ascent)
+        return agl_series(df, g)
+
+    # Reference dataset
+    ref_df = dfs[0].copy()
+    ref_agl = compute_agl(ref_df)
+    drop_index=start_drop(ref_df,ref_agl)
+    ref_start_index = reference_point(ref_df,drop_index)
+    if ref_start_index >= len(ref_agl):
+        return datasets  # nothing to do
+
+    # Find reference sync index: index >= start_index minimizing |AGL - target|
+    ref_slice = np.arange(ref_start_index, len(ref_agl))
+    ref_idx = int(ref_slice[np.argmin(np.abs(ref_agl[ref_slice] - target_agl))])
+
+    out_dfs: List[pd.DataFrame] = [ref_df]
+
+    for k in range(1, len(dfs)):
+        df = dfs[k].copy()
+        agl = compute_agl(df)
+        drop_index=start_drop(df,agl)
+        start_index=reference_point(df,drop_index)
+        if start_index >= len(agl):
+            out_dfs.append(df)
+            continue
+
+        slice_idx = np.arange(start_index, len(agl))
+        sync_idx = int(slice_idx[np.argmin(np.abs(agl[slice_idx] - target_agl))])
+
+        if sync_idx == ref_idx:
+            out_dfs.append(df)
+            continue
+
+        if sync_idx < ref_idx:
+            # Need to pad (ref_idx - sync_idx) rows at the front
+            pad_n = ref_idx - sync_idx
+            first_row = df.iloc[0:1].copy()
+            pads = pd.concat([first_row] * pad_n, ignore_index=True)
+            df = pd.concat([pads, df], ignore_index=True)
+        else:
+            # Need to drop first (sync_idx - ref_idx) rows
+            drop_n = sync_idx - ref_idx
+            if drop_n < len(df):
+                df = df.iloc[drop_n:].reset_index(drop=True)
+            else:
+                # Degenerate: all dropped, keep a single repeated row
+                df = pd.DataFrame([dfs[k].iloc[0].to_dict()])
+
+        out_dfs.append(df)
+
+    if with_labels:
+        return list(zip(labels, out_dfs))
+    return out_dfs
+
+def cleanupDataSet(
+    datasets: List[Tuple[str, pd.DataFrame]] | List[pd.DataFrame],
+    target_agl: float = 2500.0,
+    cut_to_parachute: bool = True,
+) -> List[Tuple[str, pd.DataFrame]] | List[pd.DataFrame]:
+    """
+    1) Relocate datasets (align) on target_agl using relocateDataset.
+    2) For each dataset: remove rows before reference point (drop+9s ref).
+    3) Optionally cut after parachute deployment index.
+    Returns same shape (with labels if provided).
+    """
+    if not datasets:
+        return datasets
+
+    aligned = relocateDataset(datasets, target_agl=target_agl)
+    with_labels = isinstance(aligned[0], tuple) and len(aligned[0]) == 2
+    if with_labels:
+        labels, dfs = zip(*aligned)
+        dfs = list(dfs)
+    else:
+        dfs = list(aligned)
+
+    cleaned: List[pd.DataFrame] = []
+    for df in dfs:
+        df2 = df.copy()
+
+        # Compute AGL + reference point
+        idx_ascent = start_aircraft_ascent(df2)
+        ground = average_ground_altitude(df2, idx_ascent)
+        agl = agl_series(df2, ground)
+
+        idx_drop = start_drop(df2, agl)
+        idx_ref = reference_point(df2, idx_drop if idx_drop is not None else 0)
+
+        if idx_ref is not None and 0 <= idx_ref < len(df2):
+            df2 = df2.iloc[idx_ref:].reset_index(drop=True)
+            # Recompute AGL after trimming
+            idx_ascent2 = start_aircraft_ascent(df2)
+            ground2 = average_ground_altitude(df2, idx_ascent2)
+            agl2 = agl_series(df2, ground2)
+        else:
+            agl2 = agl  # fallback
+
+        # Parachute cut
+        if cut_to_parachute:
+            p_idx = parachute_deployment(df2, agl2)
+            if p_idx is not None and p_idx + 1 < len(df2):
+                df2 = df2.iloc[:p_idx + 1].reset_index(drop=True)
+
+        cleaned.append(df2)
+
+    if with_labels:
+        return list(zip(labels, cleaned))
+    return cleaned
+
+
 def plot_time_altitude_metrics(
     datasets: List[Tuple[str, pd.DataFrame]],
-    vertical_sign: str = "down",   # "down" => displays vz positive downwards (more intuitive during descent)
+    vertical_sign: str = "down",
     shade_alpha: float = 0.12,
-    vz_smooth_window: int = 1,     # optional smoothing of vertical speed
+    glidezone_startagl: float = 2500.0,
+    glidezone_stopagl: float = 1500.0,
 ) -> None:
     """
-    Displays 3 separate graphs (no subplots):
-        1) Horizontal speed
-        2) Vertical speed
-        3) Glide ratio (glide ratio = Vh / Vz_down)
-    - X-axis: aligned time (t=0 at the first passage below 2500 m AGL)
-    - Y-axis: altitude AGL (m)
-    - Shaded background: glide phase (from 2500 m -> 1500 m AGL)
-    - Multiple datasets possible; each dataset is plotted with its points.
+    Single figure (no subplots) with multiple y-axes:
+      - Altitude (left)
+      - Horizontal speed, Vertical speed, Glide ratio (stacked on right with offset spines)
+    Each metric has its own axis; time aligned on reference dataset at glidezone_startagl.
     """
-    # Prepare datasets
-    prepared = []
-    for (label, df) in datasets:
-        t = _to_datetime_utc(df["time"])
-        if not t.notna().any():
-            print(f"[WARN] '{label}': invalid 'time' column.")
-            continue
-
-        v_h = _ground_speed_mps(df)  # m/s
-        v_z_up = _vertical_speed_up_mps(df)  # m/s (up +)
-        if vz_smooth_window > 1:
-            v_z_up = pd.Series(v_z_up).rolling(vz_smooth_window, center=True, min_periods=1).mean().to_numpy()
-
-        # AGL
-        idx_ascent = start_aircraft_ascent(df)
-        ground_altitude = average_ground_altitude(df, idx_ascent)
-        agl = agl_series(df, ground_altitude)
-
-        # Glide markers
-        idx_glide_start = start_glide_2500(df, agl, 0)
-        if idx_glide_start is None:
-            print(f"[WARN] '{label}': start of glide (2500 m) not found.")
-            continue
-        idx_glide_end = end_glide_1500(df, agl, idx_glide_start)
-        if idx_glide_end is None:
-            print(f"[WARN] '{label}': end of glide (1500 m) not found.")
-            continue
-
-        t0 = t.iloc[idx_glide_start]
-        t_aligned = (t - t0).dt.total_seconds().to_numpy()
-        t_glide_end = float((t.iloc[idx_glide_end] - t0).total_seconds())
-
-        # Vertical speed sign for display
-        vz_plot = -v_z_up if vertical_sign.lower() == "down" else v_z_up
-
-        # Instantaneous glide ratio (horizontal speed / descent)
-        vz_down = np.maximum(1e-3, -v_z_up)   # m/s (descent positive)
-        glide_ratio = v_h / vz_down
-
-        prepared.append(dict(
-            label=label, t=t_aligned, z=agl, vh=v_h, vz=vz_plot, gr=glide_ratio,
-            t_gs=0.0, t_ge=t_glide_end
-        ))
-
-    if not prepared:
-        print("[INFO] No valid dataset to plot.")
+    if not datasets:
         return
 
-    def _plot_metric(key: str, title: str, unit: str):
-        plt.figure(figsize=(10, 6))
-        ax = plt.gca()
-        # Glide zone for each dataset
-        for d in prepared:
-            ax.axvspan(d["t_gs"], d["t_ge"], alpha=shade_alpha)
-        # Scatter plot for all datasets
-        for d in prepared:
-            x = d["t"]; y = d["z"]; val = d[key]
-            m = np.isfinite(x) & np.isfinite(y) & np.isfinite(val)
-            # One cloud per dataset, default colors (no imposed style)
-            ax.scatter(x[m], y[m], s=10, alpha=0.9)
-        ax.set_xlabel("Aligned time since start of glide (s)")
-        ax.set_ylabel("Altitude AGL (m)")
-        ax.set_title(f"{title}")
-        ax.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
-        # Simple legend
-        ax.legend([d["label"] for d in prepared], title="Datasets", loc="best")
-        plt.tight_layout()
-        plt.show()
+    labels, dfs = zip(*datasets)
 
-    _plot_metric("vh", "Horizontal Speed (m/s)", "m/s")
-    _plot_metric("vz", "Vertical Speed" + (" (m/s, down +)" if vertical_sign.lower() == "down" else " (m/s, up +)"), "m/s")
-    _plot_metric("gr", "Instantaneous Glide Ratio", "-")
+    def prep(df: pd.DataFrame):
+        idx_ascent = start_aircraft_ascent(df)
+        ground = average_ground_altitude(df, idx_ascent)
+        agl = agl_series(df, ground)
+        t = _to_datetime_utc(df["time"])
+        vh = _ground_speed_mps(df)
+        vz_up = _vertical_speed_up_mps(df)
+        vz = -vz_up if vertical_sign.lower() == "down" else vz_up
+        if vertical_sign.lower() == "down":
+            denom = vz.copy()
+        else:
+            denom = np.maximum(-vz_up, 0.0)
+        gr = np.full_like(vh, np.nan)
+        mask = denom > 0.3
+        gr[mask] = vh[mask] / denom[mask]
+        return t, agl, vh, vz, gr
+
+    ref_t, ref_agl, *_ = prep(dfs[0])
+    ref_idx_candidates = np.where(np.isfinite(ref_agl))[0]
+    if ref_idx_candidates.size == 0:
+        return
+    ref_idx = int(ref_idx_candidates[np.argmin(np.abs(ref_agl[ref_idx_candidates] - glidezone_startagl))])
+    t0_ref = ref_t.iloc[ref_idx]
+
+    import matplotlib.colors as mcolors
+    metric_colors = {
+        "alt": "#1f77b4",
+        "vh": "#ff7f0e",
+        "vz": "#2ca02c",
+        "gr": "#d62728",
+    }
+
+    def variant(color, i, n):
+        rgb = np.array(mcolors.to_rgb(color))
+        if n <= 1:
+            return rgb
+        w = 0.6 * (1 - i / max(n - 1, 1))
+        return rgb * (1 - w) + w * 1.0
+
+    fig, ax_alt = plt.subplots(figsize=(11, 6))
+    ax_alt.set_ylabel("AGL (m)", color=metric_colors["alt"])
+    ax_alt.tick_params(axis='y', colors=metric_colors["alt"])
+    ax_alt.grid(True, alpha=0.35)
+
+    # Create additional axes
+    ax_vh = ax_alt.twinx()
+    ax_vh.set_ylabel("Horiz V (m/s)", color=metric_colors["vh"])
+    ax_vh.tick_params(axis='y', colors=metric_colors["vh"])
+
+    ax_vz = ax_alt.twinx()
+    ax_vz.set_ylabel(f"Vert V ({'down' if vertical_sign.lower()=='down' else 'up'}) (m/s)", color=metric_colors["vz"])
+    ax_vz.tick_params(axis='y', colors=metric_colors["vz"])
+
+    ax_gr = ax_alt.twinx()
+    ax_gr.set_ylabel("Glide ratio", color=metric_colors["gr"])
+    ax_gr.tick_params(axis='y', colors=metric_colors["gr"])
+
+    # Offset right-side spines
+    axes_right = [ax_vh, ax_vz, ax_gr]
+    offsets = [0.0, 60, 120]  # pts
+    for ax, off in zip(axes_right, offsets):
+        ax.spines["right"].set_position(("outward", off))
+        ax.spines["right"].set_visible(True)
+
+    # Shaded altitude band
+    ax_alt.axhspan(glidezone_stopagl, glidezone_startagl, color="gray", alpha=shade_alpha, zorder=0)
+
+    lines_for_legend = []
+    metric_legend_handles = [
+        plt.Line2D([], [], color=metric_colors["alt"], label="Altitude"),
+        plt.Line2D([], [], color=metric_colors["vh"], label="Horizontal Speed"),
+        plt.Line2D([], [], color=metric_colors["vz"], label="Vertical Speed"),
+        plt.Line2D([], [], color=metric_colors["gr"], label="Glide Ratio"),
+    ]
+
+    for i, (label, df) in enumerate(zip(labels, dfs)):
+        t, agl, vh, vz, gr = prep(df)
+        
+        # Time axis (seconds from reference alignment point of reference dataset)
+        time_s = (t - t0_ref).dt.total_seconds().to_numpy()
+
+        c_alt = variant(metric_colors["alt"], i, len(dfs))
+        c_vh  = variant(metric_colors["vh"],  i, len(dfs))
+        c_vz  = variant(metric_colors["vz"],  i, len(dfs))
+        c_gr  = variant(metric_colors["gr"],  i, len(dfs))
+
+        l_alt, = ax_alt.plot(time_s[:len(agl)], agl, color=c_alt, lw=1.3,
+                             label=label)  # dataset legend from altitude lines
+        ax_vh.plot(time_s[:len(vh)], vh, color=c_vh, lw=1.0)
+        ax_vz.plot(time_s[:len(vz)], vz, color=c_vz, lw=1.0)
+        ax_gr.plot(time_s[:len(gr)], gr, color=c_gr, lw=1.0)
+
+        lines_for_legend.append(l_alt)
+
+    ax_alt.set_xlabel("Time aligned (s)")
+
+    # Dataset legend (top-left)
+    if lines_for_legend:
+        ax_alt.legend(handles=lines_for_legend, title="Datasets", loc="upper left")
+
+    # Metric legend (top-right)
+    ax_alt.legend(handles=metric_legend_handles, title="Metrics", loc="upper right")
+    # Combine both legends (keep order)
+    handles = lines_for_legend + metric_legend_handles
+    labels_all = [h.get_label() for h in handles]
+    ax_alt.legend(handles, labels_all, loc="lower right", framealpha=0.85)
+
+    plt.tight_layout()
+    plt.show()

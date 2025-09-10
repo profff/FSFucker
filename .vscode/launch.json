@@ -1,0 +1,16 @@
+{
+    "configurations": [
+        {
+            "name": "FS FUCKER",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "FS_FUCKER.py",
+            "args": [
+                 ".\\DataSets\\originals\\371_1.CSV",
+                 ".\\DataSets\\fixed\\371_1.CSV",
+                 "--plot"
+            ],
+            "console": "externalTerminal"
+        },
+    ]
+}

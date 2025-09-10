@@ -22,9 +22,10 @@ def main():
 
     (ds_original, units) = read_csv_gps(input_csv)
     pprint(ds_original)
+    dsclean=cleanupDataSet([("original", ds_original)])
 
     if enable_plot:
-        plot_time_altitude_metrics([("original", ds_original)])
+        plot_time_altitude_metrics(dsclean)
 
 
 if __name__ == "__main__":
