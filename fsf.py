@@ -262,22 +262,29 @@ def reference_point(df: pd.DataFrame, idx_drop: int=0, vhTreshold : float= 10.0,
 # =========================
 # 7) Start of glide (2500 m) & end (1500 m)
 # =========================
+def agl_index(df: pd.DataFrame, agl: np.ndarray, idx_start_search: Optional[int], threshold=1000) -> Optional[int]:
+    """
+    First passage below startagl m AGL after idx_start_search (inclusive).
+    """
+    start = idx_start_search or 0
+    idxs = np.where(agl[start:] < threshold)[0]
+    return int(start + idxs[0]) if idxs.size else None
 
-def start_glide_2500(df: pd.DataFrame, agl: np.ndarray, idx_start_search: Optional[int], startagl=2500) -> Optional[int]:
+def start_glide_2500(df: pd.DataFrame, agl: np.ndarray, idx_start_search: Optional[int], threshold=2500) -> Optional[int]:
     """
     First passage below 2500 m AGL after idx_start_search (inclusive).
     """
     start = idx_start_search or 0
-    idxs = np.where(agl[start:] < startagl)[0]
+    idxs = np.where(agl[start:] < threshold)[0]
     return int(start + idxs[0]) if idxs.size else None
 
-def end_glide_1500(df: pd.DataFrame, agl: np.ndarray, idx_glide_start: Optional[int]) -> Optional[int]:
+def end_glide_1500(df: pd.DataFrame, agl: np.ndarray, idx_glide_start: Optional[int], threshold=1500) -> Optional[int]:
     """
     First passage below 1500 m AGL after the start of the glide.
     """
     if idx_glide_start is None:
         return None
-    idxs = np.where(agl[idx_glide_start:] < 1500.0)[0]
+    idxs = np.where(agl[idx_glide_start:] < threshold)[0]
     return int(idx_glide_start + idxs[0]) if idxs.size else None
 
 
@@ -287,7 +294,7 @@ def end_glide_1500(df: pd.DataFrame, agl: np.ndarray, idx_glide_start: Optional[
 
 def parachute_deployment(df: pd.DataFrame,
                          agl: np.ndarray,
-                         min_agl_m: float = 1000.0,
+                         min_agl_m: float = 500.0,
                          max_agl_m: float = 1500.0,
                          window_s: float = 2.0,
                          min_drop_kmh: float = 20.0,
@@ -773,60 +780,6 @@ def relocateDataset(
         return list(zip(labels, out_dfs))
     return out_dfs
 
-def cleanupDataSet(
-    datasets: List[Tuple[str, pd.DataFrame]] | List[pd.DataFrame],
-    target_agl: float = 2500.0,
-    cut_to_parachute: bool = True,
-) -> List[Tuple[str, pd.DataFrame]] | List[pd.DataFrame]:
-    """
-    1) Relocate datasets (align) on target_agl using relocateDataset.
-    2) For each dataset: remove rows before reference point (drop+9s ref).
-    3) Optionally cut after parachute deployment index.
-    Returns same shape (with labels if provided).
-    """
-    if not datasets:
-        return datasets
-
-    aligned = relocateDataset(datasets, target_agl=target_agl)
-    with_labels = isinstance(aligned[0], tuple) and len(aligned[0]) == 2
-    if with_labels:
-        labels, dfs = zip(*aligned)
-        dfs = list(dfs)
-    else:
-        dfs = list(aligned)
-
-    cleaned: List[pd.DataFrame] = []
-    for df in dfs:
-        df2 = df.copy()
-
-        # Compute AGL + reference point
-        idx_ascent = start_aircraft_ascent(df2)
-        ground = average_ground_altitude(df2, idx_ascent)
-        agl = agl_series(df2, ground)
-
-        idx_drop = start_drop(df2, agl)
-        idx_ref = reference_point(df2, idx_drop if idx_drop is not None else 0)
-
-        if idx_ref is not None and 0 <= idx_ref < len(df2):
-            df2 = df2.iloc[idx_ref:].reset_index(drop=True)
-            # Recompute AGL after trimming
-            idx_ascent2 = start_aircraft_ascent(df2)
-            ground2 = average_ground_altitude(df2, idx_ascent2)
-            agl2 = agl_series(df2, ground2)
-        else:
-            agl2 = agl  # fallback
-
-        # Parachute cut
-        if cut_to_parachute:
-            p_idx = parachute_deployment(df2, agl2)
-            if p_idx is not None and p_idx + 1 < len(df2):
-                df2 = df2.iloc[:p_idx + 1].reset_index(drop=True)
-
-        cleaned.append(df2)
-
-    if with_labels:
-        return list(zip(labels, cleaned))
-    return cleaned
 
 
 def plot_time_altitude_metrics(
@@ -854,6 +807,11 @@ def plot_time_altitude_metrics(
         t = _to_datetime_utc(df["time"])
         vh = _ground_speed_mps(df)
         vz_up = _vertical_speed_up_mps(df)
+        ref = reference_point(df, idx_drop=start_drop(df, agl))
+        low = agl_index(df, agl, idx_start_search=ref, threshold=1000)
+        pd = parachute_deployment(df, agl, startidx=ref)
+        stglide= start_glide_2500(df, agl, idx_start_search=ref)
+        endglide= end_glide_1500(df, agl, idx_glide_start=stglide)
         vz = -vz_up if vertical_sign.lower() == "down" else vz_up
         if vertical_sign.lower() == "down":
             denom = vz.copy()
@@ -862,7 +820,7 @@ def plot_time_altitude_metrics(
         gr = np.full_like(vh, np.nan)
         mask = denom > 0.3
         gr[mask] = vh[mask] / denom[mask]
-        return t, agl, vh, vz, gr
+        return t, agl, vh, vz, gr, ref, low, pd, stglide, endglide
 
     ref_t, ref_agl, *_ = prep(dfs[0])
     ref_idx_candidates = np.where(np.isfinite(ref_agl))[0]
@@ -923,18 +881,25 @@ def plot_time_altitude_metrics(
     ]
 
     for i, (label, df) in enumerate(zip(labels, dfs)):
-        t, agl, vh, vz, gr = prep(df)
-        
+        t, agl, vh, vz, gr, ref, low,pd, stglide, endglide = prep(df)
+
         # Time axis (seconds from reference alignment point of reference dataset)
-        time_s = (t - t0_ref).dt.total_seconds().to_numpy()
+        t0=t.iloc[stglide]
+        t=t[ref:low]
+        time_s = (t - t0).dt.total_seconds().to_numpy()
 
         c_alt = variant(metric_colors["alt"], i, len(dfs))
         c_vh  = variant(metric_colors["vh"],  i, len(dfs))
         c_vz  = variant(metric_colors["vz"],  i, len(dfs))
         c_gr  = variant(metric_colors["gr"],  i, len(dfs))
 
+        agl= agl[ref:low]
         l_alt, = ax_alt.plot(time_s[:len(agl)], agl, color=c_alt, lw=1.3,
                              label=label)  # dataset legend from altitude lines
+        vh=vh[ref:low]
+        vz=vz[ref:low]
+        gr=gr[ref:low]
+
         ax_vh.plot(time_s[:len(vh)], vh, color=c_vh, lw=1.0)
         ax_vz.plot(time_s[:len(vz)], vz, color=c_vz, lw=1.0)
         ax_gr.plot(time_s[:len(gr)], gr, color=c_gr, lw=1.0)
